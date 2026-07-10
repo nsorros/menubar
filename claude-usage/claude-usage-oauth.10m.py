@@ -21,6 +21,7 @@
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -43,6 +44,41 @@ GREEN = "#30d158"
 AMBER = "#ffd60a"
 RED = "#ff453a"
 GREY = "#8e8e93"
+
+# The refresh cadence is encoded in the plugin's filename (name.<interval>.py) —
+# xbar/SwiftBar has no runtime API for it, so "changing" it means renaming the
+# plugin (symlink) and letting the app's folder-watcher pick up the new token.
+INTERVAL_PRESETS = [
+    ("1m", "1 minute"),
+    ("5m", "5 minutes"),
+    ("10m", "10 minutes"),
+    ("30m", "30 minutes"),
+    ("1h", "1 hour"),
+]
+INTERVAL_RE = re.compile(r"\.(\d+[smhd])\.([^.]+)$")
+
+
+def plugin_path():
+    """Path of the plugin file as the bar app sees it — the entry whose
+    filename carries the refresh interval. SwiftBar exports it; xbar we infer
+    from how the script was invoked."""
+    return os.environ.get("SWIFTBAR_PLUGIN_PATH") or os.path.abspath(sys.argv[0])
+
+
+def current_interval():
+    m = INTERVAL_RE.search(os.path.basename(plugin_path()))
+    return m.group(1) if m else None
+
+
+def set_interval(new_iv):
+    """Rename the plugin (symlink) so a new .<interval>. token takes effect.
+    Renames the symlink itself, not its target, so the repo file keeps its
+    committed name."""
+    path = plugin_path()
+    d, base = os.path.split(path)
+    new_base = INTERVAL_RE.sub(rf".{new_iv}.\2", base)
+    if new_base != base:
+        os.rename(path, os.path.join(d, new_base))
 
 
 def read_creds():
@@ -239,9 +275,73 @@ def render(data, plan="", stale_age=None):
     print(f"Updated {datetime.now().astimezone().strftime('%H:%M:%S')} | color={GREY} size=11")
     print("Open usage page | href=https://claude.ai/settings/usage")
     print("Refresh | refresh=true")
+    print_interval_menu()
+
+
+def print_interval_menu():
+    """A submenu to change how often the bar re-fetches usage."""
+    path = plugin_path()
+    active = current_interval()
+    print(f"Refresh interval | color={GREY}")
+    for iv, label in INTERVAL_PRESETS:
+        mark = "✓ " if iv == active else "   "
+        print(
+            f'--{mark}{label} | bash="{path}" param1=--set-interval param2={iv} '
+            "terminal=false refresh=true"
+        )
+    if active and active not in {iv for iv, _ in INTERVAL_PRESETS}:
+        print(f"--(currently every {active}) | color={GREY} size=11")
+
+
+NOTIFIER = os.path.expanduser("~/Applications/Claude Usage.app/Contents/MacOS/notifly")
+NOTIFY_STATE = os.path.expanduser("~/.local/state/menubar-notify/claude-usage.json")
+LOW_THRESHOLD = 10  # % remaining
+
+
+def send_notification(title, message):
+    if os.path.exists(NOTIFIER):
+        try:
+            subprocess.run([NOTIFIER, "--title", title, "--message", message],
+                           capture_output=True, timeout=10)
+        except Exception:
+            pass
+
+
+def maybe_notify(data):
+    """Notify once when a window crosses into 'low' (<=10% remaining). Resets when
+    it recovers, so the next crossing (e.g. after a reset) notifies again."""
+    try:
+        state = json.loads(open(NOTIFY_STATE).read())
+    except Exception:
+        state = {}
+    changed = False
+    for key, raw, label in (("five_low", "five_hour", "5-hour session"),
+                            ("week_low", "seven_day", "Weekly limit")):
+        w = window(data.get(raw))
+        if not w:
+            continue
+        low = w["remaining"] <= LOW_THRESHOLD
+        if low and not state.get(key, False):
+            send_notification("Claude Usage", f"{label} at {w['remaining']:.0f}% — running low")
+        if low != state.get(key, False):
+            state[key] = low
+            changed = True
+    if changed:
+        try:
+            os.makedirs(os.path.dirname(NOTIFY_STATE), exist_ok=True)
+            open(NOTIFY_STATE, "w").write(json.dumps(state))
+        except Exception:
+            pass
 
 
 def main():
+    if len(sys.argv) > 2 and sys.argv[1] == "--set-interval":
+        try:
+            set_interval(sys.argv[2])
+        except Exception:
+            pass  # best-effort; a failed rename just leaves the cadence as-is
+        return
+
     creds = read_creds()
     if not creds:
         fail("No Claude credentials found", "Sign in once via the claude CLI, then refresh.")
@@ -274,6 +374,7 @@ def main():
         fail("Could not reach usage endpoint", str(e))
 
     write_cache(data)
+    maybe_notify(data)
     render(data, plan)
 
 

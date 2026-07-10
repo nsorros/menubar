@@ -1,0 +1,33 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3b4a63"/>
+      <stop offset="1" stop-color="#1e2633"/>
+    </linearGradient>
+  </defs>
+  <rect x="96" y="96" width="832" height="832" rx="196" fill="url(#tile)"/>
+  <rect x="96" y="96" width="832" height="832" rx="196" fill="none" stroke="#ffffff" stroke-opacity="0.06" stroke-width="4"/>
+
+  <!-- Claude-style sunburst: tapered rays radiating from centre -->
+  <g fill="#e0855c" transform="translate(512,512)">
+    <g id="rays">
+      <path d="M0,-250 L34,-70 L-34,-70 Z"/>
+    </g>
+    <use href="#rays" transform="rotate(45)"/>
+    <use href="#rays" transform="rotate(90)"/>
+    <use href="#rays" transform="rotate(135)"/>
+    <use href="#rays" transform="rotate(180)"/>
+    <use href="#rays" transform="rotate(225)"/>
+    <use href="#rays" transform="rotate(270)"/>
+    <use href="#rays" transform="rotate(315)"/>
+    <use href="#rays" transform="rotate(22)"/>
+    <use href="#rays" transform="rotate(67)"/>
+    <use href="#rays" transform="rotate(112)"/>
+    <use href="#rays" transform="rotate(157)"/>
+    <use href="#rays" transform="rotate(202)"/>
+    <use href="#rays" transform="rotate(247)"/>
+    <use href="#rays" transform="rotate(292)"/>
+    <use href="#rays" transform="rotate(337)"/>
+    <circle r="66" fill="#e0855c"/>
+  </g>
+</svg>

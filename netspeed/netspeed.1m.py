@@ -5,6 +5,8 @@
 
 import json
 import os
+import socket
+import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from statistics import mean
@@ -50,6 +52,59 @@ def in_window(rows, td):
     return [r for r in rows if r["_ts"] >= cutoff]
 
 
+NOTIFIER = os.path.expanduser("~/Applications/Net Speed.app/Contents/MacOS/notifly")
+NOTIFY_STATE = os.path.expanduser("~/.local/state/menubar-notify/netspeed.json")
+DEGRADED_RATIO = 0.30  # notify when latest download < 30% of recent average
+
+
+def send_notification(title, message):
+    if os.path.exists(NOTIFIER):
+        try:
+            subprocess.run([NOTIFIER, "--title", title, "--message", message],
+                           capture_output=True, timeout=10)
+        except Exception:
+            pass
+
+
+def internet_up():
+    for host in ("1.1.1.1", "8.8.8.8"):
+        try:
+            socket.create_connection((host, 53), timeout=1.0).close()
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def maybe_notify(rows):
+    """Notify on transitions into 'internet down' or 'speed degraded'."""
+    try:
+        state = json.loads(open(NOTIFY_STATE).read())
+    except Exception:
+        state = {}
+    down = not internet_up()
+    if down and not state.get("down", False):
+        send_notification("Net Speed", "Internet appears to be down")
+
+    degraded = False
+    if not down and rows:
+        recent = in_window(rows, timedelta(hours=24)) or rows
+        avg_dl = mean(r["download"] for r in recent)
+        latest = rows[-1]["download"]
+        if avg_dl > 0 and latest < DEGRADED_RATIO * avg_dl:
+            degraded = True
+            if not state.get("degraded", False):
+                send_notification("Net Speed", f"Slow: {mbps(latest):.0f} Mbps (avg {mbps(avg_dl):.0f})")
+
+    new_state = {"down": down, "degraded": degraded}
+    if new_state != state:
+        try:
+            os.makedirs(os.path.dirname(NOTIFY_STATE), exist_ok=True)
+            open(NOTIFY_STATE, "w").write(json.dumps(new_state))
+        except Exception:
+            pass
+
+
 rows = load()
 
 if not rows:
@@ -91,3 +146,9 @@ else:
     print(f"Run probe now | bash={PROBE} terminal=false refresh=true")
     print(f"Stats 7d in terminal | bash={STATS} param1=7d terminal=true")
     print(f"Open log | bash=/usr/bin/open param1={LOG} terminal=false")
+
+# Fire notifications after the menu has been printed (kept last so a slow
+# connectivity check never delays the menu-bar render).
+import sys as _sys
+_sys.stdout.flush()
+maybe_notify(rows)
