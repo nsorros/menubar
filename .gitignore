@@ -3,3 +3,6 @@
 log.jsonl
 probe.err
 .DS_Store
+
+__pycache__/
+*.pyc

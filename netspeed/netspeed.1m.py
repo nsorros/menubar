@@ -16,8 +16,25 @@ from statistics import mean
 HERE = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("NETSPEED_DATA_DIR", Path.home() / ".local" / "share" / "netspeed"))
 LOG = DATA_DIR / "log.jsonl"
+LOCATIONS = DATA_DIR / "locations.json"
 PROBE = HERE / "net-speed-probe"
 STATS = HERE / "net-speed-stats"
+
+
+def load_locations():
+    """Map of router (gateway) MAC -> friendly location name. Edit
+    locations.json to name a spot; unknown routers fall back to their MAC."""
+    try:
+        return {k.lower(): v for k, v in json.loads(LOCATIONS.read_text()).items()}
+    except Exception:
+        return {}
+
+
+def loc_of(row, locs):
+    mac = (row.get("gateway_mac") or "").lower()
+    if not mac:
+        return None  # sample predates fingerprinting
+    return locs.get(mac) or f"unknown ({mac[-8:]})"
 
 
 def load():
@@ -120,17 +137,41 @@ else:
 
     print("---")
 
+    locs = load_locations()
+    here = loc_of(last, locs)
+
     srv = last.get("server") or {}
     srv_name = srv.get("name") or srv.get("sponsor") or "?"
     pl = last.get("packet_loss")
     loss = f" · {pl:.0f}% loss" if pl is not None else ""
+    where = f"📍 {here} · " if here else ""
     print(
-        f"Last: ↓ {mbps(last['download']):.1f} ↑ {mbps(last['upload']):.1f} Mbps "
+        f"Last: {where}↓ {mbps(last['download']):.1f} ↑ {mbps(last['upload']):.1f} Mbps "
         f"· {last['ping']:.0f} ms{loss} · "
         f"{last['_ts'].astimezone().strftime('%H:%M %d %b')} ({age_min:.0f}m ago)"
     )
     print(f"via {srv_name} · {last.get('isp', '?')} | size=11 color=gray")
     print("---")
+
+    # By location (last 30d), best-download first. Only shown once samples
+    # carry a fingerprint — old samples group under "unknown".
+    by_loc = {}
+    for r in in_window(rows, timedelta(days=30)):
+        lbl = loc_of(r, locs)
+        if lbl is None:
+            continue
+        by_loc.setdefault(lbl, []).append(r)
+    if by_loc:
+        print("By location (30d)")
+        for lbl, w in sorted(by_loc.items(), key=lambda kv: -max(r["download"] for r in kv[1])):
+            avg_dl = mean(r["download"] for r in w)
+            avg_ul = mean(r["upload"] for r in w)
+            avg_ping = mean(r["ping"] for r in w if r.get("ping") is not None)
+            here_mark = " ←" if lbl == here else ""
+            print(f"{lbl} ({len(w)} samples){here_mark}")
+            print(f"  avg  ↓ {mbps(avg_dl):6.1f}  ↑ {mbps(avg_ul):6.1f} Mbps  · {avg_ping:.0f} ms | size=12")
+        print("---")
+
     for label, td in [("24h", timedelta(hours=24)), ("7d", timedelta(days=7)), ("30d", timedelta(days=30))]:
         w = in_window(rows, td)
         if not w:
@@ -145,6 +186,8 @@ else:
     print("---")
     print(f"Run probe now | bash={PROBE} terminal=false refresh=true")
     print(f"Stats 7d in terminal | bash={STATS} param1=7d terminal=true")
+    print(f"Stats by location | bash={STATS} param1=loc terminal=true")
+    print(f"Edit locations | bash=/usr/bin/open param1={LOCATIONS} terminal=false")
     print(f"Open log | bash=/usr/bin/open param1={LOG} terminal=false")
 
 # Fire notifications after the menu has been printed (kept last so a slow
