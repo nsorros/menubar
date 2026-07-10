@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""Stats over the net-speed log.
+
+Usage:
+  net-speed-stats              # all time
+  net-speed-stats 24h          # last 24 hours
+  net-speed-stats 7d           # last 7 days
+"""
+import json
+import os
+import re
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from statistics import mean
+
+DATA_DIR = Path(os.environ.get("NETSPEED_DATA_DIR", Path.home() / ".local" / "share" / "netspeed"))
+LOG = DATA_DIR / "log.jsonl"
+
+
+def parse_window(spec: str | None) -> timedelta | None:
+    if not spec:
+        return None
+    m = re.fullmatch(r"(\d+)([hdwm])", spec)
+    if not m:
+        sys.exit(f"bad window: {spec!r} (use 24h, 7d, 2w, 1m)")
+    n, unit = int(m.group(1)), m.group(2)
+    return {"h": timedelta(hours=n), "d": timedelta(days=n), "w": timedelta(weeks=n), "m": timedelta(days=30 * n)}[unit]
+
+
+def mbps(bps: float) -> float:
+    return bps / 1_000_000
+
+
+def fmt_row(label: str, dl: float, ul: float, ping: float | None = None) -> str:
+    if ping is None:
+        return f"  {label:<8}  ↓ {dl:6.1f} Mbps   ↑ {ul:6.1f} Mbps"
+    return f"  {label:<8}  ↓ {dl:6.1f} Mbps   ↑ {ul:6.1f} Mbps   {ping:5.1f} ms"
+
+
+def main():
+    if not LOG.exists():
+        sys.exit(f"no log yet at {LOG}")
+
+    window = parse_window(sys.argv[1] if len(sys.argv) > 1 else None)
+    cutoff = datetime.now(timezone.utc) - window if window else None
+
+    rows = []
+    for line in LOG.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            r = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        ts = datetime.fromisoformat(r["timestamp"].replace("Z", "+00:00"))
+        if cutoff and ts < cutoff:
+            continue
+        rows.append((ts, r["download"], r["upload"], r["ping"]))
+
+    if not rows:
+        sys.exit("no samples in window")
+
+    dls = [r[1] for r in rows]
+    uls = [r[2] for r in rows]
+    pings = [r[3] for r in rows]
+    last = rows[-1]
+
+    label = f"last {sys.argv[1]}" if window else "all time"
+    print(f"net-speed ({label})  —  {len(rows)} sample{'s' if len(rows) != 1 else ''}")
+    print(fmt_row("max",  mbps(max(dls)), mbps(max(uls))))
+    print(fmt_row("avg",  mbps(mean(dls)), mbps(mean(uls)), mean(pings)))
+    print(fmt_row("min",  mbps(min(dls)), mbps(min(uls))))
+    print(fmt_row("last", mbps(last[1]),  mbps(last[2]),  last[3]))
+    print(f"  latest sample: {last[0].astimezone().strftime('%Y-%m-%d %H:%M')}")
+
+
+if __name__ == "__main__":
+    main()

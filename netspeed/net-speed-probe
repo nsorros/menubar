@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Net-speed probe: runs Ookla's official `speedtest` CLI and appends one
+# JSON line per run to log.jsonl. Emits a legacy-compatible schema
+# (download/upload in BITS per second, ping in ms) so the xbar plugin and
+# the older speedtest-cli samples already in the log stay readable.
+
+LOG_DIR="${NETSPEED_DATA_DIR:-$HOME/.local/share/netspeed}"
+LOG_FILE="$LOG_DIR/log.jsonl"
+ERR_FILE="$LOG_DIR/probe.err"
+SPEEDTEST="/opt/homebrew/bin/speedtest"
+mkdir -p "$LOG_DIR"
+
+if ! raw=$("$SPEEDTEST" --format=json --accept-license --accept-gdpr 2>>"$ERR_FILE"); then
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) probe failed (exit $?)" >> "$ERR_FILE"
+    exit 0
+fi
+
+# Ookla reports bandwidth in BYTES/sec; the legacy schema (and the plugin)
+# expect BITS/sec, so multiply by 8. Remap into the old field names.
+line=$(/opt/homebrew/bin/python3 - "$raw" <<'PY'
+import json, sys
+try:
+    d = json.loads(sys.argv[1])
+    iface = d.get("interface", {}) or {}
+    srv = d.get("server", {}) or {}
+    out = {
+        "download": d["download"]["bandwidth"] * 8,   # bytes/s -> bits/s
+        "upload": d["upload"]["bandwidth"] * 8,
+        "ping": d.get("ping", {}).get("latency"),
+        "packet_loss": d.get("packetLoss"),
+        "isp": d.get("isp"),
+        "vpn": bool(iface.get("isVpn")),
+        "server": {
+            "name": srv.get("name"),
+            "location": srv.get("location"),
+            "country": srv.get("country"),
+            "host": srv.get("host"),
+            "id": srv.get("id"),
+        },
+        "result_url": d.get("result", {}).get("url"),
+        "timestamp": d.get("timestamp"),
+    }
+    print(json.dumps(out))
+except Exception as e:
+    sys.stderr.write(f"parse failed: {e}\n")
+    sys.exit(1)
+PY
+) || { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) parse failed" >> "$ERR_FILE"; exit 0; }
+
+echo "$line" >> "$LOG_FILE"

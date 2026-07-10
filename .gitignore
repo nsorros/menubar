@@ -1,0 +1,5 @@
+# runtime data / caches — never committed
+*.log
+log.jsonl
+probe.err
+.DS_Store
