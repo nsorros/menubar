@@ -187,7 +187,9 @@ else:
     print(f"Run probe now | bash={PROBE} terminal=false refresh=true")
     print(f"Stats 7d in terminal | bash={STATS} param1=7d terminal=true")
     print(f"Stats by location | bash={STATS} param1=loc terminal=true")
-    print(f"Edit locations | bash=/usr/bin/open param1={LOCATIONS} terminal=false")
+    # Open in VS Code (a real editable window) rather than the default .json
+    # handler, which on some machines is a read-only viewer like Safari.
+    print(f"Edit locations | bash=/usr/bin/open param1=-b param2=com.microsoft.VSCode param3={LOCATIONS} terminal=false")
     print(f"Open log | bash=/usr/bin/open param1={LOG} terminal=false")
 
 # Fire notifications after the menu has been printed (kept last so a slow
