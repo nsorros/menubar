@@ -153,7 +153,7 @@ else:
     print(f"via {srv_name} · {last.get('isp', '?')} | size=11 color=gray")
     print("---")
 
-    # By location (last 30d), best-download first. Only shown once samples
+    # By location (last 30d), most-visited first. Only shown once samples
     # carry a fingerprint — old samples group under "unknown".
     by_loc = {}
     for r in in_window(rows, timedelta(days=30)):
@@ -163,9 +163,10 @@ else:
         by_loc.setdefault(lbl, []).append(r)
     if by_loc:
         print("By location (30d)")
-        # Cap to the 3 fastest locations so the menu stays short when many
-        # networks have been seen.
-        ranked = sorted(by_loc.items(), key=lambda kv: -max(r["download"] for r in kv[1]))
+        # Cap to the 3 most-visited locations (by sample count) so the menu
+        # stays short and converges on the regular spots (home / office /
+        # coffee) rather than a fast-but-rare network.
+        ranked = sorted(by_loc.items(), key=lambda kv: -len(kv[1]))
         for lbl, w in ranked[:3]:
             avg_dl = mean(r["download"] for r in w)
             avg_ul = mean(r["upload"] for r in w)
