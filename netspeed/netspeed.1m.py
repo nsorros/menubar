@@ -163,7 +163,10 @@ else:
         by_loc.setdefault(lbl, []).append(r)
     if by_loc:
         print("By location (30d)")
-        for lbl, w in sorted(by_loc.items(), key=lambda kv: -max(r["download"] for r in kv[1])):
+        # Cap to the 3 fastest locations so the menu stays short when many
+        # networks have been seen.
+        ranked = sorted(by_loc.items(), key=lambda kv: -max(r["download"] for r in kv[1]))
+        for lbl, w in ranked[:3]:
             avg_dl = mean(r["download"] for r in w)
             avg_ul = mean(r["upload"] for r in w)
             avg_ping = mean(r["ping"] for r in w if r.get("ping") is not None)
