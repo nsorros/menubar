@@ -8,8 +8,19 @@ the dropdown. Three pieces:
 | `net-speed-probe` | Runs Ookla's `speedtest` CLI and appends one JSON line per run to the log. Driven by a launchd job every 5 min. |
 | `netspeed.1m.py` | The xbar plugin — reads the log and renders it. Holds no data. |
 | `net-speed-stats` | CLI to print max/avg/min over a window (`net-speed-stats 7d`) or per location (`net-speed-stats loc`). Also the plugin's "Stats" buttons. |
+| `name-location` | Seeds the current router's MAC into `locations.json` and opens it — backs the **Name this location** menu item. |
 | `locations.example.json` | Sample router-MAC → location map. Copy to the data dir as `locations.json` to name your spots. |
 | `com.nick.netspeed.plist` | launchd template for the background probe. |
+
+## Menu controls
+
+- **Refresh** — runs a fresh probe now (a full speedtest) and redraws, rather
+  than waiting for the next scheduled probe.
+- **Refresh interval** — how often the menu bar re-reads the log (1m…1h). Like
+  the claude-usage plugin, this is encoded in the plugin filename, so choosing a
+  preset renames the symlink (`netspeed.1m.py` → `netspeed.5m.py`). It changes
+  the *display* cadence only; actual measurements run on the launchd probe's own
+  schedule (every 5 min) — use **Refresh** to force a new one.
 
 ## Per-location stats
 
