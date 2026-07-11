@@ -19,7 +19,10 @@ Services permission — which a launchd probe doesn't — but the router's ARP e
 reads with no permission and is unique per network, so it doubles as a stable
 per-location fingerprint (home vs coffee vs office).
 
-Name your locations by mapping MAC → label in
+The quickest way to name where you are: click **Name this location** in the menu
+(shown with a ⚠️ while the current spot is still `unknown`). It seeds the current
+router's MAC into `locations.json` as `"rename me"` and opens the file — just
+change the label and save. Or edit the map by hand: MAC → label in
 `~/.local/share/netspeed/locations.json` (see `locations.example.json`):
 
 ```json
