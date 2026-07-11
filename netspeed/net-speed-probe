@@ -12,6 +12,18 @@ ERR_FILE="$LOG_DIR/probe.err"
 SPEEDTEST="/opt/homebrew/bin/speedtest"
 mkdir -p "$LOG_DIR"
 
+# Location fingerprint: the default gateway's IP + hardware (router) MAC.
+# macOS redacts the Wi-Fi SSID/BSSID from CLI tools unless the caller holds
+# Location Services permission (which a launchd probe does not), but the
+# router's ARP entry is readable with no special permission and is unique
+# per network — so it doubles as a stable per-location signature.
+gw_ip=$(route -n get default 2>/dev/null | awk '/gateway:/{print $2}')
+gw_mac=""
+if [ -n "$gw_ip" ]; then
+    gw_mac=$(arp -n "$gw_ip" 2>/dev/null | awk -F'at |on ' '/at /{print $2}' | tr '[:upper:]' '[:lower:]' | xargs)
+fi
+export GW_IP="$gw_ip" GW_MAC="$gw_mac"
+
 if ! raw=$("$SPEEDTEST" --format=json --accept-license --accept-gdpr 2>>"$ERR_FILE"); then
     echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) probe failed (exit $?)" >> "$ERR_FILE"
     exit 0
@@ -20,7 +32,7 @@ fi
 # Ookla reports bandwidth in BYTES/sec; the legacy schema (and the plugin)
 # expect BITS/sec, so multiply by 8. Remap into the old field names.
 line=$(/opt/homebrew/bin/python3 - "$raw" <<'PY'
-import json, sys
+import json, os, sys
 try:
     d = json.loads(sys.argv[1])
     iface = d.get("interface", {}) or {}
@@ -41,6 +53,8 @@ try:
         },
         "result_url": d.get("result", {}).get("url"),
         "timestamp": d.get("timestamp"),
+        "gateway_ip": os.environ.get("GW_IP") or None,
+        "gateway_mac": os.environ.get("GW_MAC") or None,
     }
     print(json.dumps(out))
 except Exception as e:

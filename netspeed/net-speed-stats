@@ -5,6 +5,8 @@ Usage:
   net-speed-stats              # all time
   net-speed-stats 24h          # last 24 hours
   net-speed-stats 7d           # last 7 days
+  net-speed-stats loc          # break down by location (all time)
+  net-speed-stats loc 7d       # break down by location, last 7 days
 """
 import json
 import os
@@ -16,6 +18,21 @@ from statistics import mean
 
 DATA_DIR = Path(os.environ.get("NETSPEED_DATA_DIR", Path.home() / ".local" / "share" / "netspeed"))
 LOG = DATA_DIR / "log.jsonl"
+LOCATIONS = DATA_DIR / "locations.json"
+
+
+def load_locations():
+    try:
+        return {k.lower(): v for k, v in json.loads(LOCATIONS.read_text()).items()}
+    except Exception:
+        return {}
+
+
+def loc_of(rec, locs):
+    mac = (rec.get("gateway_mac") or "").lower()
+    if not mac:
+        return "unknown (no fingerprint)"
+    return locs.get(mac) or f"unknown ({mac[-8:]})"
 
 
 def parse_window(spec: str | None) -> timedelta | None:
@@ -42,7 +59,12 @@ def main():
     if not LOG.exists():
         sys.exit(f"no log yet at {LOG}")
 
-    window = parse_window(sys.argv[1] if len(sys.argv) > 1 else None)
+    args = sys.argv[1:]
+    by_location = bool(args) and args[0] in ("loc", "--by-location", "location")
+    if by_location:
+        args = args[1:]
+
+    window = parse_window(args[0] if args else None)
     cutoff = datetime.now(timezone.utc) - window if window else None
 
     rows = []
@@ -57,18 +79,33 @@ def main():
         ts = datetime.fromisoformat(r["timestamp"].replace("Z", "+00:00"))
         if cutoff and ts < cutoff:
             continue
-        rows.append((ts, r["download"], r["upload"], r["ping"]))
+        rows.append((ts, r["download"], r["upload"], r["ping"], r))
 
     if not rows:
         sys.exit("no samples in window")
+
+    win_label = f"last {args[0]}" if window else "all time"
+
+    if by_location:
+        locs = load_locations()
+        groups = {}
+        for row in rows:
+            groups.setdefault(loc_of(row[4], locs), []).append(row)
+        print(f"net-speed by location ({win_label})  —  {len(rows)} samples")
+        for lbl, g in sorted(groups.items(), key=lambda kv: -max(r[1] for r in kv[1])):
+            dls, uls, pings = [r[1] for r in g], [r[2] for r in g], [r[3] for r in g]
+            print(f"\n{lbl}  ({len(g)} samples)")
+            print(fmt_row("max", mbps(max(dls)), mbps(max(uls))))
+            print(fmt_row("avg", mbps(mean(dls)), mbps(mean(uls)), mean(pings)))
+            print(fmt_row("min", mbps(min(dls)), mbps(min(uls))))
+        return
 
     dls = [r[1] for r in rows]
     uls = [r[2] for r in rows]
     pings = [r[3] for r in rows]
     last = rows[-1]
 
-    label = f"last {sys.argv[1]}" if window else "all time"
-    print(f"net-speed ({label})  —  {len(rows)} sample{'s' if len(rows) != 1 else ''}")
+    print(f"net-speed ({win_label})  —  {len(rows)} sample{'s' if len(rows) != 1 else ''}")
     print(fmt_row("max",  mbps(max(dls)), mbps(max(uls))))
     print(fmt_row("avg",  mbps(mean(dls)), mbps(mean(uls)), mean(pings)))
     print(fmt_row("min",  mbps(min(dls)), mbps(min(uls))))
