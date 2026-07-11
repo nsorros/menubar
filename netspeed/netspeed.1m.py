@@ -5,8 +5,10 @@
 
 import json
 import os
+import re
 import socket
 import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from statistics import mean
@@ -20,6 +22,59 @@ LOCATIONS = DATA_DIR / "locations.json"
 PROBE = HERE / "net-speed-probe"
 STATS = HERE / "net-speed-stats"
 NAMELOC = HERE / "name-location"
+
+# The refresh cadence is encoded in the plugin filename (name.<interval>.py) —
+# xbar/SwiftBar has no runtime API for it, so "changing" it means renaming the
+# plugin (symlink) and letting the app's folder-watcher pick up the new token.
+# Mirrors the claude-usage plugin. Note this controls how often the menu bar
+# re-reads the log; the actual speed measurement runs on its own launchd
+# schedule (com.nick.netspeed, every 5 min) — "Refresh" forces a probe now.
+INTERVAL_PRESETS = [
+    ("1m", "1 minute"),
+    ("5m", "5 minutes"),
+    ("10m", "10 minutes"),
+    ("30m", "30 minutes"),
+    ("1h", "1 hour"),
+]
+INTERVAL_RE = re.compile(r"\.(\d+[smhd])\.([^.]+)$")
+
+
+def plugin_path():
+    """Path of the plugin as the bar app sees it — the entry whose filename
+    carries the refresh interval. SwiftBar exports it; for xbar we infer it
+    from how the script was invoked (the symlink, not the repo target)."""
+    return os.environ.get("SWIFTBAR_PLUGIN_PATH") or os.path.abspath(sys.argv[0])
+
+
+def current_interval():
+    m = INTERVAL_RE.search(os.path.basename(plugin_path()))
+    return m.group(1) if m else None
+
+
+def set_interval(new_iv):
+    """Rename the plugin (symlink) so a new .<interval>. token takes effect.
+    Renames the symlink itself, not its target, so the repo file keeps its
+    committed name."""
+    path = plugin_path()
+    d, base = os.path.split(path)
+    new_base = INTERVAL_RE.sub(rf".{new_iv}.\2", base)
+    if new_base != base:
+        os.rename(path, os.path.join(d, new_base))
+
+
+def print_interval_menu():
+    """A submenu to change how often the bar re-reads the log."""
+    path = plugin_path()
+    active = current_interval()
+    print("Refresh interval | color=gray")
+    for iv, label in INTERVAL_PRESETS:
+        mark = "✓ " if iv == active else "   "
+        print(
+            f'--{mark}{label} | bash="{path}" param1=--set-interval param2={iv} '
+            "terminal=false refresh=true"
+        )
+    if active and active not in {iv for iv, _ in INTERVAL_PRESETS}:
+        print(f"--(currently every {active}) | color=gray size=11")
 
 
 def load_locations():
@@ -123,12 +178,20 @@ def maybe_notify(rows):
             pass
 
 
+# Handle the "set refresh interval" action (from the submenu) before rendering.
+if len(sys.argv) > 2 and sys.argv[1] == "--set-interval":
+    try:
+        set_interval(sys.argv[2])
+    except Exception:
+        pass  # best-effort; a failed rename just leaves the cadence as-is
+    sys.exit(0)
+
 rows = load()
 
 if not rows:
     print("net: —")
     print("---")
-    print(f"No samples yet | bash={PROBE} terminal=false refresh=true")
+    print(f"Refresh | bash={PROBE} terminal=false refresh=true")
 else:
     last = rows[-1]
     age_min = (datetime.now(timezone.utc) - last["_ts"]).total_seconds() / 60
@@ -189,7 +252,9 @@ else:
         print(f"  max  ↓ {mbps(max_dl):6.1f}  ↑ {mbps(max_ul):6.1f} Mbps")
         print(f"  avg  ↓ {mbps(avg_dl):6.1f}  ↑ {mbps(avg_ul):6.1f} Mbps")
     print("---")
-    print(f"Run probe now | bash={PROBE} terminal=false refresh=true")
+    # "Refresh" runs a fresh probe (speedtest) and redraws — the manual analog
+    # of the periodic launchd probe. Named to match the claude-usage plugin.
+    print(f"Refresh | bash={PROBE} terminal=false refresh=true")
     print(f"Stats 7d in terminal | bash={STATS} param1=7d terminal=true")
     print(f"Stats by location | bash={STATS} param1=loc terminal=true")
     # Naming a spot means editing locations.json — but a network you've never
@@ -207,9 +272,9 @@ else:
     if not unnamed:
         print(name_item)
     print(f"Open log | bash=/usr/bin/open param1={LOG} terminal=false")
+    print_interval_menu()
 
 # Fire notifications after the menu has been printed (kept last so a slow
 # connectivity check never delays the menu-bar render).
-import sys as _sys
-_sys.stdout.flush()
+sys.stdout.flush()
 maybe_notify(rows)
