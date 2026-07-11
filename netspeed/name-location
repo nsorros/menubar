@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Name-this-location helper for the netspeed xbar plugin.
+#
+# The plugin fingerprints each spot by its router (gateway) MAC. To *name* a
+# spot you edit locations.json — but a network you've never named has no line
+# in that file, so there was nothing to edit (you'd have to hand-type a MAC you
+# don't know). This script derives the CURRENT gateway MAC exactly the way the
+# probe does, seeds it into locations.json with a "rename me" placeholder if
+# it's not there yet, then opens the file so the line is ready to rename.
+
+LOG_DIR="${NETSPEED_DATA_DIR:-$HOME/.local/share/netspeed}"
+LOC_FILE="$LOG_DIR/locations.json"
+mkdir -p "$LOG_DIR"
+
+# Same derivation as net-speed-probe: default gateway IP -> ARP -> router MAC.
+gw_ip=$(route -n get default 2>/dev/null | awk '/gateway:/{print $2}')
+gw_mac=""
+if [ -n "$gw_ip" ]; then
+    gw_mac=$(arp -n "$gw_ip" 2>/dev/null | awk -F'at |on ' '/at /{print $2}' | tr '[:upper:]' '[:lower:]' | xargs)
+fi
+
+GW_MAC="$gw_mac" LOC_FILE="$LOC_FILE" /opt/homebrew/bin/python3 - <<'PY'
+import json, os, sys
+
+path = os.environ["LOC_FILE"]
+mac = (os.environ.get("GW_MAC") or "").strip().lower()
+
+try:
+    locs = json.loads(open(path).read())
+    if not isinstance(locs, dict):
+        locs = {}
+except FileNotFoundError:
+    locs = {}
+except Exception:
+    # Don't clobber a file we can't parse — bail so the user can fix it by hand.
+    print("Could not read locations.json — open it and check the JSON.", file=sys.stderr)
+    sys.exit(0)
+
+if not mac:
+    print("Could not detect this network's router MAC (no default gateway?).",
+          file=sys.stderr)
+elif mac not in locs:
+    locs[mac] = "rename me"
+    # Stable key order keeps diffs small; new entry lands wherever sort puts it.
+    open(path, "w").write(json.dumps(dict(sorted(locs.items())), indent=2) + "\n")
+    print(f"Added {mac} -> \"rename me\"")
+else:
+    print(f"{mac} is already named \"{locs[mac]}\"")
+PY
+
+# Open in VS Code (a real editable window) rather than the default .json
+# handler, which on some machines is a read-only viewer like Safari. Fall back
+# to the default opener if VS Code isn't installed.
+open -b com.microsoft.VSCode "$LOC_FILE" 2>/dev/null || open "$LOC_FILE"

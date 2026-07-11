@@ -19,6 +19,7 @@ LOG = DATA_DIR / "log.jsonl"
 LOCATIONS = DATA_DIR / "locations.json"
 PROBE = HERE / "net-speed-probe"
 STATS = HERE / "net-speed-stats"
+NAMELOC = HERE / "name-location"
 
 
 def load_locations():
@@ -191,9 +192,20 @@ else:
     print(f"Run probe now | bash={PROBE} terminal=false refresh=true")
     print(f"Stats 7d in terminal | bash={STATS} param1=7d terminal=true")
     print(f"Stats by location | bash={STATS} param1=loc terminal=true")
+    # Naming a spot means editing locations.json — but a network you've never
+    # named has no line there, so "Edit locations" alone opens a file with
+    # nothing to rename. "Name this location" seeds the current router's MAC
+    # (with a "rename me" placeholder) and opens the file ready to edit. Lead
+    # with it when the current spot is still unnamed.
+    unnamed = here is None or here.startswith("unknown")
+    name_item = f"Name this location | bash={NAMELOC} terminal=false refresh=true"
+    if unnamed:
+        print(f"⚠️ {name_item}")
     # Open in VS Code (a real editable window) rather than the default .json
     # handler, which on some machines is a read-only viewer like Safari.
     print(f"Edit locations | bash=/usr/bin/open param1=-b param2=com.microsoft.VSCode param3={LOCATIONS} terminal=false")
+    if not unnamed:
+        print(name_item)
     print(f"Open log | bash=/usr/bin/open param1={LOG} terminal=false")
 
 # Fire notifications after the menu has been printed (kept last so a slow
