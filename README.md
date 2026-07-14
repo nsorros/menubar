@@ -8,13 +8,14 @@ README; this top-level file just covers the shared setup.
 |--------|---------------|--------|
 | **Claude usage** | Your Claude subscription usage (5-hour + weekly windows) from the OAuth usage API | [`claude-usage/`](claude-usage/) |
 | **Net speed** | Latest / max / avg internet speed from a local Ookla speedtest probe | [`netspeed/`](netspeed/) |
+| **OpenRouter credits** | Credit balance left on your OpenRouter account, plus this key's spend | [`openrouter-credits/`](openrouter-credits/) |
 
 ## Prerequisites
 
 - **[xbar](https://xbarapp.com)** — `brew install --cask xbar`. It runs the
   scripts in `~/Library/Application Support/xbar/plugins` and renders their
   stdout in the menu bar.
-- **Python 3** — both plugins are stdlib-only (no `pip install` needed).
+- **Python 3** — every plugin is stdlib-only (no `pip install` needed).
 
 ## Install
 
@@ -34,6 +35,9 @@ ln -sf "$PWD/claude-usage/claude-usage-oauth.10m.py" "$PLUGINS/"
 # Net speed (also sets up the background probe — see netspeed/README.md)
 ln -sf "$PWD/netspeed/netspeed.1m.py" "$PLUGINS/"
 ./netspeed/install.sh
+
+# OpenRouter credits (needs an API key in the keychain — see its README)
+ln -sf "$PWD/openrouter-credits/openrouter-credits.10m.py" "$PLUGINS/"
 ```
 
 Then open xbar (or **xbar → Refresh all**). Per-plugin details, caveats, and
