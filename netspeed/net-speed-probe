@@ -12,12 +12,40 @@ ERR_FILE="$LOG_DIR/probe.err"
 SPEEDTEST="/opt/homebrew/bin/speedtest"
 mkdir -p "$LOG_DIR"
 
-# Location fingerprint: the default gateway's IP + hardware (router) MAC.
+# Location fingerprint: the PHYSICAL gateway's IP + hardware (router) MAC.
 # macOS redacts the Wi-Fi SSID/BSSID from CLI tools unless the caller holds
 # Location Services permission (which a launchd probe does not), but the
 # router's ARP entry is readable with no special permission and is unique
 # per network — so it doubles as a stable per-location signature.
-gw_ip=$(route -n get default 2>/dev/null | awk '/gateway:/{print $2}')
+#
+# A VPN owns the default route via a tunnel interface (utun*/ppp*/ipsec*),
+# whose gateway is a virtual peer address with no ARP entry — fingerprinting
+# that yields an empty MAC and the location is lost. So we deliberately look
+# past the default route to the underlying physical interface's gateway.
+gw_ip=""
+
+# 1. Honour the default route only when it already exits a hardware
+#    interface (Wi-Fi/Ethernet/bridge) — i.e. no VPN in the way.
+def_if=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')
+case "$def_if" in
+    en*|bridge*) gw_ip=$(route -n get default 2>/dev/null | awk '/gateway:/{print $2}') ;;
+esac
+
+# 2. Otherwise (VPN active, or no default route) find a physical interface
+#    that has an IPv4 lease, and use its DHCP-supplied router. First match
+#    wins; en0 is the built-in Wi-Fi/Ethernet on most Macs.
+if [ -z "$gw_ip" ]; then
+    for iface in $(ifconfig -l); do
+        case "$iface" in en*|bridge*) ;; *) continue ;; esac
+        ipconfig getifaddr "$iface" >/dev/null 2>&1 || continue
+        router=$(ipconfig getoption "$iface" router 2>/dev/null)
+        if [ -n "$router" ]; then
+            gw_ip="$router"
+            break
+        fi
+    done
+fi
+
 gw_mac=""
 if [ -n "$gw_ip" ]; then
     gw_mac=$(arp -n "$gw_ip" 2>/dev/null | awk -F'at |on ' '/at /{print $2}' | tr '[:upper:]' '[:lower:]' | xargs)
