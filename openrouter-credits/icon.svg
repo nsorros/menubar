@@ -1,0 +1,25 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3b4a63"/>
+      <stop offset="1" stop-color="#1e2633"/>
+    </linearGradient>
+  </defs>
+  <rect x="96" y="96" width="832" height="832" rx="196" fill="url(#tile)"/>
+  <rect x="96" y="96" width="832" height="832" rx="196" fill="none" stroke="#ffffff" stroke-opacity="0.06" stroke-width="4"/>
+
+  <!-- Router: one inbound request fanned out to three model endpoints -->
+  <g transform="translate(512,512)" fill="none" stroke="#8b9aff" stroke-width="26"
+     stroke-linecap="round">
+    <path d="M-210,0 H-90"/>
+    <path d="M-90,0 C10,0 30,-160 150,-160"/>
+    <path d="M-90,0 H150"/>
+    <path d="M-90,0 C10,0 30,160 150,160"/>
+  </g>
+  <g transform="translate(512,512)" fill="#8b9aff">
+    <circle cx="-210" cy="0" r="54"/>
+    <circle cx="190" cy="-160" r="44"/>
+    <circle cx="190" cy="0" r="44"/>
+    <circle cx="190" cy="160" r="44"/>
+  </g>
+</svg>
