@@ -1,8 +1,8 @@
 #!/usr/bin/python3
-# <xbar.title>Claude Usage (5h + Weekly)</xbar.title>
+# <xbar.title>Claude + Codex Usage</xbar.title>
 # <xbar.version>v1.0</xbar.version>
 # <xbar.author>Nick</xbar.author>
-# <xbar.desc>Claude Code subscription usage: 5-hour session + weekly % remaining, read from the Anthropic OAuth usage endpoint using the local Claude Code credentials (keychain).</xbar.desc>
+# <xbar.desc>Claude Code subscription usage plus the latest local Codex rate-limit window.</xbar.desc>
 # <xbar.dependencies>python3</xbar.dependencies>
 #
 # How it works:
@@ -28,12 +28,16 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+from glob import glob
 
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 KEYCHAIN_SERVICE = "Claude Code-credentials"
 CREDS_FILE = os.path.expanduser("~/.claude/.credentials.json")
 BETA_HEADER = "oauth-2025-04-20"
 CACHE_FILE = os.path.expanduser("~/.claude-usage-oauth-cache.json")
+CODEX_SESSIONS_DIR = os.path.expanduser("~/.codex/sessions")
+CODEX_PREFERRED_WINDOW_MINUTES = 5 * 60
+CODEX_FALLBACK_WINDOW_MINUTES = 7 * 24 * 60
 
 # At login / wake-from-sleep the network often isn't up yet when SwiftBar fires
 # the plugin. Retry a few times to ride out that gap before giving up.
@@ -193,6 +197,88 @@ def pct(w):
     return f"{w['remaining']:.0f}%" if w else "—"
 
 
+def codex_window_from_limit(limit):
+    if not isinstance(limit, dict):
+        return None
+    used = limit.get("used_percent")
+    if used is None:
+        return None
+    try:
+        used = float(used)
+    except (TypeError, ValueError):
+        return None
+    resets_at = limit.get("resets_at")
+    resets_iso = None
+    if resets_at:
+        try:
+            resets_iso = datetime.fromtimestamp(float(resets_at), timezone.utc).isoformat()
+        except (TypeError, ValueError, OSError):
+            resets_iso = None
+    return {
+        "used": used,
+        "remaining": max(0.0, 100.0 - used),
+        "resets_at": resets_iso,
+        "window_minutes": limit.get("window_minutes"),
+    }
+
+
+def latest_codex_rate_limits(max_files=30):
+    files = glob(os.path.join(CODEX_SESSIONS_DIR, "*", "*", "*", "*.jsonl"))
+    files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+
+    latest = None
+    for path in files[:max_files]:
+        try:
+            with open(path) as f:
+                for line in f:
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    payload = obj.get("payload") or {}
+                    if obj.get("type") != "event_msg" or payload.get("type") != "token_count":
+                        continue
+                    rate_limits = payload.get("rate_limits")
+                    if rate_limits:
+                        latest = (obj.get("timestamp"), rate_limits)
+        except OSError:
+            continue
+        if latest:
+            return latest
+    return None
+
+
+def read_codex_window(preferred_minutes=CODEX_PREFERRED_WINDOW_MINUTES):
+    latest = latest_codex_rate_limits()
+    if not latest:
+        return None
+
+    _, rate_limits = latest
+    for key in ("primary", "secondary", "individual_limit"):
+        w = codex_window_from_limit(rate_limits.get(key))
+        if w and w.get("window_minutes") == preferred_minutes:
+            return {"kind": key, **w}
+
+    for key in ("primary", "secondary", "individual_limit"):
+        w = codex_window_from_limit(rate_limits.get(key))
+        if w and w.get("window_minutes") == CODEX_FALLBACK_WINDOW_MINUTES:
+            return {"kind": key, **w}
+    return None
+
+
+def codex_window_label(w):
+    if not w:
+        return "5h"
+    if w.get("window_minutes") == CODEX_PREFERRED_WINDOW_MINUTES:
+        return "5h"
+    if w.get("window_minutes") == CODEX_FALLBACK_WINDOW_MINUTES:
+        return "7d"
+    mins = w.get("window_minutes")
+    if isinstance(mins, (int, float)):
+        return f"{int(mins)}m"
+    return "usage"
+
+
 def section(label, w):
     if not w:
         print(f"{label}: n/a | color={GREY}")
@@ -238,9 +324,15 @@ def render(data, plan="", stale_age=None):
     sonnet = window(data.get("seven_day_sonnet"))
     opus = window(data.get("seven_day_opus"))
     extra = data.get("extra_usage") or {}
+    codex = read_codex_window()
+    codex_label = codex_window_label(codex)
 
     # ---- menu bar title ----
-    title = f":sparkle: {dot_for(five['remaining'] if five else None)}5h{pct(five)}·{dot_for(week['remaining'] if week else None)}7d{pct(week)}"
+    title = (
+        f":sparkle: {dot_for(five['remaining'] if five else None)}5h{pct(five)}"
+        f"·{dot_for(week['remaining'] if week else None)}7d{pct(week)}"
+        f"·{dot_for(codex['remaining'] if codex else None)}C{codex_label}{pct(codex)}"
+    )
     # SwiftBar only supports one color for the whole status item, so the title
     # stays neutral and the per-window state is carried by the dots.
     title_color = GREY if stale_age is not None else None
@@ -259,6 +351,13 @@ def render(data, plan="", stale_age=None):
         section("Weekly · Sonnet", sonnet)
     if opus:
         section("Weekly · Opus", opus)
+
+    print("---")
+    print(f"Codex usage | size=12 color={GREY}")
+    if codex:
+        section(f"Codex · {codex_label} window", codex)
+    else:
+        print(f"Codex · 5h/7d window: n/a | color={GREY}")
 
     if extra.get("is_enabled"):
         used = extra.get("used_credits")

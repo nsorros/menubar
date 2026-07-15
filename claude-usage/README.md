@@ -1,8 +1,8 @@
-# Claude usage
+# Claude + Codex usage
 
 Shows your Claude subscription usage in the menu bar — the rolling 5-hour
-window and the weekly window — so you can see how close you are to a limit
-without opening anything.
+window and the weekly window — plus the latest local Codex rate-limit window, so
+you can see how close you are to a limit without opening anything.
 
 It reads your Claude Code OAuth token and calls the usage API:
 
@@ -14,6 +14,10 @@ It reads your Claude Code OAuth token and calls the usage API:
   hiccup still shows the last-known numbers.
 
 No secrets live in this repo — the token is read from your machine at runtime.
+
+For Codex, the plugin reads the latest `rate_limits` event from local Codex
+session files under `~/.codex/sessions`, prefers the 5-hour window when Codex
+records one, and falls back to the weekly window otherwise.
 
 ## Install
 
