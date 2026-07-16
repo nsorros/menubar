@@ -197,10 +197,21 @@ def ant_costs(hours=COST_WINDOW_HOURS):
             "items": items}
 
 
-def render_cost_breakdown(hours=COST_WINDOW_HOURS):
-    """Print the 'where do costs happen' dropdown section. Never raises — a
-    broken source is simply left out."""
-    sources = [s for s in (meeting_recorder_costs(hours), ant_costs(hours)) if s]
+def cost_sources(hours=COST_WINDOW_HOURS):
+    """Both per-source cost breakdowns that reported, biggest spend first.
+
+    Computed once so the trailing-window total can feed the menu-bar title AND
+    the dropdown section off a single ant fetch. Never raises — a broken source
+    is simply left out."""
+    try:
+        sources = [s for s in (meeting_recorder_costs(hours), ant_costs(hours)) if s]
+    except Exception:
+        return []
+    return sorted(sources, key=lambda x: x["total"], reverse=True)
+
+
+def render_cost_breakdown(sources, hours=COST_WINDOW_HOURS):
+    """Print the 'where do costs happen' dropdown section from `cost_sources()`."""
     print("---")
     print(f"Where costs happen · last {hours}h | size=12 color={GREY}")
     if not sources:
@@ -209,7 +220,7 @@ def render_cost_breakdown(hours=COST_WINDOW_HOURS):
         print(f"--an ant admin token is stored (see README) | color={GREY} size=11")
         return
     tracked = sum(s["total"] for s in sources)
-    for s in sorted(sources, key=lambda x: x["total"], reverse=True):
+    for s in sources:
         print(f"{s['source']}  ·  {usd(s['total'])}")
         for it in s["items"][:6]:
             print(f"--{it['label']}  {usd(it['cost'])}  ({it['calls']} calls) | font=Menlo size=11")
@@ -330,8 +341,17 @@ def render(data, stale_age=None):
     keyinfo = data.get("key") or {}
     left = remaining_of(credits)
 
+    # Computed once and reused: the trailing-window total goes in the title, the
+    # per-source breakdown fills the dropdown, off a single ant fetch.
+    sources = cost_sources()
+    tracked = sum(s["total"] for s in sources)
+
     # ---- menu bar title ----
+    # Balance (with the traffic-light dot) plus what's been spent in the window,
+    # so "where's the money going" is visible without opening the menu.
     title = f":creditcard: {dot_for(left)}{usd(left)}"
+    if tracked > 0:
+        title += f" · {usd(tracked)}/{COST_WINDOW_HOURS}h"
     # xbar/SwiftBar colors the whole status item at once, so the title stays
     # neutral and the balance state is carried by the dot.
     title_params = "font=Menlo size=13"
@@ -366,7 +386,7 @@ def render(data, stale_age=None):
     # Where the shared balance actually goes, merged from the tools that log
     # their own OpenRouter cost (meeting recorder + ant).
     try:
-        render_cost_breakdown()
+        render_cost_breakdown(sources)
     except Exception:
         pass  # a cost source must never break the balance readout
 

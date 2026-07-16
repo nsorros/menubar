@@ -4,7 +4,9 @@ Shows what's left of your OpenRouter balance in the menu bar, so a job doesn't
 fail at 2am because the account quietly ran dry.
 
 The title is the remaining balance with a traffic-light dot — green above $20,
-amber at or below it, red at or below $5. The dropdown breaks it down:
+amber at or below it, red at or below $5 — followed by what's been spent in the
+last 24h once any is tracked (e.g. `$7.00 · $0.57/24h`), so "where's the money
+going" is visible without opening the menu. The dropdown breaks it down:
 
 - **Remaining** — `total_credits - total_usage` for the whole account.
 - **This key** — the spend attributed to the key the plugin authenticates with,
