@@ -17,18 +17,39 @@
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 CREDITS_URL = "https://openrouter.ai/api/v1/credits"
 KEY_URL = "https://openrouter.ai/api/v1/key"
 KEYCHAIN_SERVICE = "openrouter-api-key"
 KEY_FILE = os.path.expanduser("~/.config/openrouter/key")
 CACHE_FILE = os.path.expanduser("~/.openrouter-credits-cache.json")
+
+# ---- "Where do the costs happen?" sources -------------------------------
+# The OpenRouter balance is shared across tools, so the account total alone
+# can't say what burned it. Two tools log their own per-call cost (each asks
+# OpenRouter for the authoritative usage.cost), and we merge them here into a
+# trailing-24h breakdown by source.
+COST_WINDOW_HOURS = int(os.environ.get("OPENROUTER_COST_WINDOW_HOURS", "24"))
+
+# 1) The meeting recorder's local SQLite ledger (one row per transcription
+#    call). Path mirrors the recorder's own STATE_DIR default.
+MREC_STATE_DIR = os.path.expanduser(
+    os.environ.get("MEETING_RECORDER_STATE_DIR", "~/.local/state/meeting-recorder"))
+MREC_COST_DB = os.path.join(MREC_STATE_DIR, "openrouter-costs.db")
+
+# 2) The ant app's server-side llm_calls, exposed at /api/admin/llm_costs.
+#    Needs the operator admin token (env -> keychain -> file); absent = ant is
+#    simply omitted from the breakdown, the recorder half still shows.
+ANT_BASE_URL = os.environ.get("ANT_BASE_URL", "https://ant.finant.ai").rstrip("/")
+ANT_TOKEN_KEYCHAIN = "ant-admin-token"
+ANT_TOKEN_FILE = os.path.expanduser("~/.config/ant/admin-token")
 
 # At login / wake-from-sleep the network often isn't up yet when xbar fires the
 # plugin. Retry a few times to ride out that gap before giving up.
@@ -100,6 +121,112 @@ def read_key():
             return f.read().strip()
     except Exception:
         return None
+
+
+def read_ant_token():
+    """Resolve the ant operator admin token. Env -> keychain -> file, like the
+    OpenRouter key. Returns None when unset (ant is then omitted, not an error)."""
+    env = os.environ.get("ANT_ADMIN_TOKEN", "").strip()
+    if env:
+        return env
+    try:
+        out = subprocess.run(
+            ["/usr/bin/security", "find-generic-password", "-s", ANT_TOKEN_KEYCHAIN, "-w"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.strip()
+    except Exception:
+        pass
+    try:
+        with open(ANT_TOKEN_FILE) as f:
+            return f.read().strip()
+    except Exception:
+        return None
+
+
+def meeting_recorder_costs(hours=COST_WINDOW_HOURS):
+    """Trailing-window spend from the meeting recorder's local ledger, by model.
+
+    Opened read-only so a missing DB (recorder not yet run) contributes nothing
+    rather than creating an empty file. Returns None when there's no ledger."""
+    if not os.path.exists(MREC_COST_DB):
+        return None
+    since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat(timespec="seconds")
+    try:
+        uri = "file:" + urllib.request.pathname2url(MREC_COST_DB) + "?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=5)
+        try:
+            rows = conn.execute(
+                "SELECT model, COUNT(*), SUM(cost) FROM openrouter_costs "
+                "WHERE created_at >= ? GROUP BY model ORDER BY SUM(cost) DESC",
+                (since,)).fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        return None
+    items = [{"label": r[0] or "unknown", "calls": int(r[1] or 0),
+              "cost": float(r[2] or 0.0)} for r in rows]
+    return {"source": "Meeting recorder", "total": sum(i["cost"] for i in items),
+            "items": items}
+
+
+def ant_costs(hours=COST_WINDOW_HOURS):
+    """Trailing-window ant spend by feature (kind), via /api/admin/llm_costs.
+
+    ant's endpoint windows in whole days; days=1 == the last 24h. Best-effort:
+    any failure (no token, network, non-24h window) returns None so the recorder
+    half still renders. Returns None when no admin token is configured."""
+    token = read_ant_token()
+    if not token or hours != 24:
+        return None
+    url = f"{ANT_BASE_URL}/api/admin/llm_costs?days=1"
+    req = urllib.request.Request(url, headers={
+        "X-Admin-Token": token,
+        "User-Agent": "openrouter-credits-menubar/1.0",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception:
+        return None
+    items = [{"label": k.get("kind") or "unknown", "calls": int(k.get("calls") or 0),
+              "cost": float(k.get("cost") or 0.0)}
+             for k in (data.get("by_kind") or [])]
+    return {"source": "ant (app)", "total": float(data.get("total_cost") or 0.0),
+            "items": items}
+
+
+def cost_sources(hours=COST_WINDOW_HOURS):
+    """Both per-source cost breakdowns that reported, biggest spend first.
+
+    Computed once so the trailing-window total can feed the menu-bar title AND
+    the dropdown section off a single ant fetch. Never raises — a broken source
+    is simply left out."""
+    try:
+        sources = [s for s in (meeting_recorder_costs(hours), ant_costs(hours)) if s]
+    except Exception:
+        return []
+    return sorted(sources, key=lambda x: x["total"], reverse=True)
+
+
+def render_cost_breakdown(sources, hours=COST_WINDOW_HOURS):
+    """Print the 'where do costs happen' dropdown section from `cost_sources()`."""
+    print("---")
+    print(f"Where costs happen · last {hours}h | size=12 color={GREY}")
+    if not sources:
+        print(f"No per-source cost data yet | color={GREY}")
+        print(f"--Runs once the meeting recorder transcribes, or once | color={GREY} size=11")
+        print(f"--an ant admin token is stored (see README) | color={GREY} size=11")
+        return
+    tracked = sum(s["total"] for s in sources)
+    for s in sources:
+        print(f"{s['source']}  ·  {usd(s['total'])}")
+        for it in s["items"][:6]:
+            print(f"--{it['label']}  {usd(it['cost'])}  ({it['calls']} calls) | font=Menlo size=11")
+        if not s["items"]:
+            print(f"--nothing in the last {hours}h | color={GREY} size=11")
+    print(f"Tracked total  ·  {usd(tracked)} | color={GREY}")
 
 
 def write_cache(data):
@@ -214,8 +341,17 @@ def render(data, stale_age=None):
     keyinfo = data.get("key") or {}
     left = remaining_of(credits)
 
+    # Computed once and reused: the trailing-window total goes in the title, the
+    # per-source breakdown fills the dropdown, off a single ant fetch.
+    sources = cost_sources()
+    tracked = sum(s["total"] for s in sources)
+
     # ---- menu bar title ----
+    # Balance (with the traffic-light dot) plus what's been spent in the window,
+    # so "where's the money going" is visible without opening the menu.
     title = f":creditcard: {dot_for(left)}{usd(left)}"
+    if tracked > 0:
+        title += f" · {usd(tracked)}/{COST_WINDOW_HOURS}h"
     # xbar/SwiftBar colors the whole status item at once, so the title stays
     # neutral and the balance state is carried by the dot.
     title_params = "font=Menlo size=13"
@@ -246,6 +382,13 @@ def render(data, stale_age=None):
             print(f"--resets {reset}")
         if keyinfo.get("is_free_tier"):
             print(f"Free tier | color={GREY}")
+
+    # Where the shared balance actually goes, merged from the tools that log
+    # their own OpenRouter cost (meeting recorder + ant).
+    try:
+        render_cost_breakdown(sources)
+    except Exception:
+        pass  # a cost source must never break the balance readout
 
     print("---")
     if stale_age is not None:
