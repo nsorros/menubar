@@ -174,9 +174,13 @@ def meeting_recorder_costs(hours=COST_WINDOW_HOURS):
 def ant_costs(hours=COST_WINDOW_HOURS):
     """Trailing-window ant spend by feature (kind), via /api/admin/llm_costs.
 
-    ant's endpoint windows in whole days; days=1 == the last 24h. Best-effort:
-    any failure (no token, network, non-24h window) returns None so the recorder
-    half still renders. Returns None when no admin token is configured."""
+    ant's endpoint windows in whole days; days=1 == the last 24h. Returns None
+    when there's nothing to ask for (no admin token, or a window ant can't
+    answer), and raises when a configured token was there but the fetch failed —
+    the caller needs that difference to explain itself accurately.
+
+    Retries like `fetch()` does: this fires at login/wake too, and a one-shot
+    attempt would lose the race with the network coming up."""
     token = read_ant_token()
     if not token or hours != 24:
         return None
@@ -185,11 +189,20 @@ def ant_costs(hours=COST_WINDOW_HOURS):
         "X-Admin-Token": token,
         "User-Agent": "openrouter-credits-menubar/1.0",
     })
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode())
-    except Exception:
-        return None
+    last_err = None
+    for attempt in range(FETCH_RETRIES):
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+            break
+        except urllib.error.HTTPError:
+            raise  # bad/expired token — retrying won't help
+        except Exception as e:
+            last_err = e
+            if attempt < FETCH_RETRIES - 1:
+                time.sleep(FETCH_BACKOFF)
+    else:
+        raise last_err
     items = [{"label": k.get("kind") or "unknown", "calls": int(k.get("calls") or 0),
               "cost": float(k.get("cost") or 0.0)}
              for k in (data.get("by_kind") or [])]
@@ -202,19 +215,37 @@ def cost_sources(hours=COST_WINDOW_HOURS):
 
     Computed once so the trailing-window total can feed the menu-bar title AND
     the dropdown section off a single ant fetch. Never raises — a broken source
-    is simply left out."""
-    try:
-        sources = [s for s in (meeting_recorder_costs(hours), ant_costs(hours)) if s]
-    except Exception:
-        return []
-    return sorted(sources, key=lambda x: x["total"], reverse=True)
+    is simply left out, but we report *that* it broke: a source that's failing
+    and a source that isn't configured look identical downstream otherwise, and
+    the dropdown used to blame a missing token for what was really a dropped
+    connection.
+
+    Returns (sources, failed) where `failed` names the sources that errored."""
+    sources, failed = [], []
+    for name, get in (("recorder", meeting_recorder_costs), ("ant", ant_costs)):
+        try:
+            s = get(hours)
+        except Exception:
+            failed.append(name)
+            continue
+        if s:
+            sources.append(s)
+    return sorted(sources, key=lambda x: x["total"], reverse=True), failed
 
 
-def render_cost_breakdown(sources, hours=COST_WINDOW_HOURS):
+def render_cost_breakdown(sources, failed=(), hours=COST_WINDOW_HOURS):
     """Print the 'where do costs happen' dropdown section from `cost_sources()`."""
     print("---")
     print(f"Where costs happen · last {hours}h | size=12 color={GREY}")
     if not sources:
+        if "ant" in failed:
+            # A stored token that couldn't be used is a very different problem
+            # from no token at all; don't send anyone to the README over a
+            # network blip at wake.
+            print(f"ant didn't answer | color={GREY}")
+            print(f"--Its costs are missing from this window. Retries on the | color={GREY} size=11")
+            print(f"--next refresh; use Refresh to retry now. | color={GREY} size=11")
+            return
         print(f"No per-source cost data yet | color={GREY}")
         print(f"--Runs once the meeting recorder transcribes, or once | color={GREY} size=11")
         print(f"--an ant admin token is stored (see README) | color={GREY} size=11")
@@ -226,6 +257,10 @@ def render_cost_breakdown(sources, hours=COST_WINDOW_HOURS):
             print(f"--{it['label']}  {usd(it['cost'])}  ({it['calls']} calls) | font=Menlo size=11")
         if not s["items"]:
             print(f"--nothing in the last {hours}h | color={GREY} size=11")
+    if "ant" in failed:
+        # The total below is real but partial — say so rather than quietly
+        # under-reporting the spend.
+        print(f"ant didn't answer — total excludes it | color={GREY} size=11")
     print(f"Tracked total  ·  {usd(tracked)} | color={GREY}")
 
 
@@ -343,7 +378,7 @@ def render(data, stale_age=None):
 
     # Computed once and reused: the trailing-window total goes in the title, the
     # per-source breakdown fills the dropdown, off a single ant fetch.
-    sources = cost_sources()
+    sources, failed_sources = cost_sources()
     tracked = sum(s["total"] for s in sources)
 
     # ---- menu bar title ----
@@ -386,7 +421,7 @@ def render(data, stale_age=None):
     # Where the shared balance actually goes, merged from the tools that log
     # their own OpenRouter cost (meeting recorder + ant).
     try:
-        render_cost_breakdown(sources)
+        render_cost_breakdown(sources, failed_sources)
     except Exception:
         pass  # a cost source must never break the balance readout
 
