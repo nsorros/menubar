@@ -26,6 +26,11 @@ going" is visible without opening the menu. The dropdown breaks it down:
   balance readout above. The "Tracked total" sums only the sources that report —
   it can be less than the account's daily usage if something spends off-ledger.
 
+  A configured-but-unreachable ant reads differently from an unconfigured one:
+  it says **"ant didn't answer"** rather than pointing at the token setup below.
+  The fetch retries (like the balance fetch) to ride out the network still coming
+  up at login/wake — the usual reason it would otherwise vanish for one refresh.
+
 Two endpoints back the balance itself:
 
 - `GET https://openrouter.ai/api/v1/credits` — account-wide credits and usage.
