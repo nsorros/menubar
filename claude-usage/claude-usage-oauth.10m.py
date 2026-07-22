@@ -27,7 +27,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from glob import glob
 
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
@@ -35,6 +35,14 @@ KEYCHAIN_SERVICE = "Claude Code-credentials"
 CREDS_FILE = os.path.expanduser("~/.claude/.credentials.json")
 BETA_HEADER = "oauth-2025-04-20"
 CACHE_FILE = os.path.expanduser("~/.claude-usage-oauth-cache.json")
+HISTORY_FILE = os.path.expanduser("~/.claude-usage-history.json")
+# Samples of the 5-hour window kept for the burn-rate regression. Only samples
+# from the *current* window are useful (a reset makes older ones meaningless),
+# so the history is keyed on the window boundary — see same_window.
+HISTORY_MAX_SAMPLES = 200
+HISTORY_MIN_SAMPLES = 3
+HISTORY_MIN_SPAN_MIN = 6  # need a bit of a baseline before a slope means anything
+WINDOW_MATCH_TOLERANCE = 300  # seconds of slack when matching a window boundary
 CODEX_SESSIONS_DIR = os.path.expanduser("~/.codex/sessions")
 CODEX_PREFERRED_WINDOW_MINUTES = 5 * 60
 CODEX_FALLBACK_WINDOW_MINUTES = 7 * 24 * 60
@@ -119,6 +127,135 @@ def read_cache():
         return blob["data"], time.time() - blob.get("fetched_at", 0)
     except Exception:
         return None, None
+
+
+def window_key(resets_at):
+    """Identity of the current 5-hour window, as an epoch timestamp of its
+    boundary (None if unknown). Compared with a tolerance — see same_window."""
+    if not resets_at:
+        return None
+    try:
+        return datetime.fromisoformat(resets_at.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def same_window(a, b):
+    """Whether two window boundaries are the same window.
+
+    The API recomputes resets_at per request, so consecutive fetches for one
+    window jitter either side of the boundary (…12:59:59.7 vs …13:00:00.2) —
+    an exact or minute-truncated match splits the history in half. A genuine
+    reset moves the boundary by hours, so a few minutes of slack is safe."""
+    if a is None or b is None:
+        return a == b
+    return abs(a - b) <= WINDOW_MATCH_TOLERANCE
+
+
+def read_history(resets_at):
+    """Samples for the current 5-hour window: [[epoch_seconds, used_pct], ...].
+
+    Returns [] if the stored history belongs to an earlier window."""
+    try:
+        with open(HISTORY_FILE) as f:
+            blob = json.load(f)
+    except Exception:
+        return []
+    if not same_window(blob.get("window"), window_key(resets_at)):
+        return []
+    samples = blob.get("samples")
+    if not isinstance(samples, list):
+        return []
+    # Belt and braces: nothing older than the window itself can be relevant.
+    cutoff = time.time() - 5 * 3600
+    return [s for s in samples if isinstance(s, list) and len(s) == 2 and s[0] >= cutoff]
+
+
+def record_sample(w):
+    """Append the current 5-hour utilization to the history and return the
+    updated sample list. Called only on a fresh fetch — replaying a cached
+    response would fabricate data points."""
+    if not w:
+        return []
+    resets_at = w.get("resets_at")
+    samples = read_history(resets_at)
+    samples.append([time.time(), w["used"]])
+    samples = samples[-HISTORY_MAX_SAMPLES:]
+    try:
+        with open(HISTORY_FILE, "w") as f:
+            json.dump({"window": window_key(resets_at), "samples": samples}, f)
+    except Exception:
+        pass
+    return samples
+
+
+def burn_rate(samples):
+    """Least-squares slope of utilization over time, in % used per hour.
+
+    Returns (slope, n, span_minutes) or None when there isn't enough history."""
+    if len(samples) < HISTORY_MIN_SAMPLES:
+        return None
+    xs = [s[0] / 3600.0 for s in samples]
+    ys = [float(s[1]) for s in samples]
+    span_min = (xs[-1] - xs[0]) * 60
+    if span_min < HISTORY_MIN_SPAN_MIN:
+        return None
+    n = len(xs)
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    var = sum((x - mx) ** 2 for x in xs)
+    if var <= 0:
+        return None
+    slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / var
+    return slope, n, span_min
+
+
+def fmt_duration(mins):
+    mins = int(mins)
+    if mins < 60:
+        return f"{mins}m"
+    return f"{mins // 60}h {mins % 60}m"
+
+
+def eta_line(w, samples):
+    """The 'time to run out' line for the 5-hour window, as a submenu item
+    printed under the 5-hour section beside "% used" and "resets ...".
+
+    The projection is a straight-line extrapolation of the fitted burn rate up
+    to 100% used. The window is rolling, so usage also ages *out* of it — treat
+    this as a trend, not a promise."""
+    fit = burn_rate(samples)
+    if not fit:
+        have = len(samples)
+        if have < HISTORY_MIN_SAMPLES:
+            need = f"{have}/{HISTORY_MIN_SAMPLES} samples"
+        else:
+            need = f"need ~{HISTORY_MIN_SPAN_MIN}m of history"
+        return f"--est. run-out: collecting data ({need}) | color={GREY}"
+    slope, n, span_min = fit
+    detail = f"{n} samples over {fmt_duration(span_min)}"
+
+    if slope <= 0.5:  # flat or recovering — nothing meaningful to project
+        return f"--est. run-out: not on this trend ({slope:+.0f}%/h, {detail}) | color={GREY}"
+
+    hours_left = w["remaining"] / slope
+    mins_left = hours_left * 60
+    eta = datetime.now(timezone.utc) + timedelta(hours=hours_left)
+
+    # If the window resets before we'd hit the cap, the cap is never reached.
+    reset_dt = None
+    if w.get("resets_at"):
+        try:
+            reset_dt = datetime.fromisoformat(w["resets_at"].replace("Z", "+00:00"))
+        except Exception:
+            reset_dt = None
+    if reset_dt and eta > reset_dt:
+        return (f"--est. run-out: after reset at {slope:.0f}%/h — window clears first "
+                f"| color={GREEN}")
+
+    when = eta.astimezone().strftime("%H:%M")
+    color = RED if mins_left <= 30 else (AMBER if mins_left <= 90 else GREEN)
+    return f"--est. run-out: {when} (in {fmt_duration(mins_left)}) · {slope:.0f}%/h | color={color}"
 
 
 def fmt_age(secs):
@@ -346,6 +483,8 @@ def render(data, plan="", stale_age=None):
     print(f"Claude{(' ' + plan) if plan else ''} usage | size=12 color={GREY}")
     print("---")
     section("5-hour session", five)
+    if five:
+        print(eta_line(five, read_history(five.get("resets_at"))))
     section("Weekly · all models", week)
     if sonnet:
         section("Weekly · Sonnet", sonnet)
@@ -473,6 +612,7 @@ def main():
         fail("Could not reach usage endpoint", str(e))
 
     write_cache(data)
+    record_sample(window(data.get("five_hour")))
     maybe_notify(data)
     render(data, plan)
 
