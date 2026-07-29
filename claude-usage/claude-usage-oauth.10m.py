@@ -46,6 +46,7 @@ WINDOW_MATCH_TOLERANCE = 300  # seconds of slack when matching a window boundary
 CODEX_SESSIONS_DIR = os.path.expanduser("~/.codex/sessions")
 CODEX_PREFERRED_WINDOW_MINUTES = 5 * 60
 CODEX_FALLBACK_WINDOW_MINUTES = 7 * 24 * 60
+PULSE_STATUS_FILE = os.path.expanduser("~/.local/state/pulse/run-status.json")
 
 # At login / wake-from-sleep the network often isn't up yet when SwiftBar fires
 # the plugin. Retry a few times to ride out that gap before giving up.
@@ -127,6 +128,23 @@ def read_cache():
         return blob["data"], time.time() - blob.get("fetched_at", 0)
     except Exception:
         return None, None
+
+
+def pulse_failure():
+    """Return the latest blocking Pulse/Claude failure, if any."""
+    try:
+        with open(PULSE_STATUS_FILE) as f:
+            s = json.load(f)
+    except Exception:
+        return None
+    if s.get("state") != "failed":
+        return None
+    category = s.get("failure_category")
+    if category not in ("subscription_access_disabled", "usage_limit"):
+        return None
+    label = ("subscription access disabled" if category == "subscription_access_disabled"
+             else "usage limit reached")
+    return {"label": label, "at": s.get("finished_at"), "message": s.get("message")}
 
 
 def window_key(resets_at):
@@ -463,6 +481,7 @@ def render(data, plan="", stale_age=None):
     extra = data.get("extra_usage") or {}
     codex = read_codex_window()
     codex_label = codex_window_label(codex)
+    pulse_problem = pulse_failure()
 
     # ---- menu bar title ----
     title = (
@@ -470,6 +489,8 @@ def render(data, plan="", stale_age=None):
         f"·{dot_for(week['remaining'] if week else None)}7d{pct(week)}"
         f"·{dot_for(codex['remaining'] if codex else None)}C{codex_label}{pct(codex)}"
     )
+    if pulse_problem:
+        title = "⚠ Claude paused · " + title
     # SwiftBar only supports one color for the whole status item, so the title
     # stays neutral and the per-window state is carried by the dots.
     title_color = GREY if stale_age is not None else None
@@ -480,6 +501,17 @@ def render(data, plan="", stale_age=None):
 
     # ---- dropdown ----
     print("---")
+    if pulse_problem:
+        when = ""
+        try:
+            when = " since " + datetime.fromisoformat(
+                pulse_problem["at"].replace("Z", "+00:00")).astimezone().strftime("%H:%M")
+        except Exception:
+            pass
+        print(f"⚠ Pulse blocked: {pulse_problem['label']}{when} | color={RED}")
+        if pulse_problem.get("message"):
+            print(f"--{pulse_problem['message'][:180]} | color={GREY} size=11")
+        print("---")
     print(f"Claude{(' ' + plan) if plan else ''} usage | size=12 color={GREY}")
     print("---")
     section("5-hour session", five)
