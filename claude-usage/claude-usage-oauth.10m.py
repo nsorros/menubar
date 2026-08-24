@@ -2,7 +2,7 @@
 # <xbar.title>Claude + Codex Usage</xbar.title>
 # <xbar.version>v1.0</xbar.version>
 # <xbar.author>Nick</xbar.author>
-# <xbar.desc>Claude Code subscription usage plus the latest local Codex rate-limit window.</xbar.desc>
+# <xbar.desc>Claude Code subscription usage plus live Codex rate-limit windows.</xbar.desc>
 # <xbar.dependencies>python3</xbar.dependencies>
 #
 # How it works:
@@ -17,13 +17,21 @@
 #        extra_usage -> pay-as-you-go overage (if enabled)
 #   We display % REMAINING = 100 - utilization.
 #
+# Codex usage comes from its own chain of four sources — the wham usage API, the
+# `codex app-server` JSON-RPC interface, the local rollout logs, and a cache of
+# the last good fetch. See the block comment above codex_window() for why, and
+# run `claude-usage-oauth.10m.py --codex-debug` to see what each one returns.
+#
 # No secret is ever printed; only usage percentages and reset times.
 
 import json
 import os
+import queue
 import re
+import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -44,8 +52,14 @@ HISTORY_MIN_SAMPLES = 3
 HISTORY_MIN_SPAN_MIN = 6  # need a bit of a baseline before a slope means anything
 WINDOW_MATCH_TOLERANCE = 300  # seconds of slack when matching a window boundary
 CODEX_SESSIONS_DIR = os.path.expanduser("~/.codex/sessions")
+CODEX_ARCHIVED_SESSIONS_DIR = os.path.expanduser("~/.codex/archived_sessions")
+CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+CODEX_USAGE_PAGE = "https://chatgpt.com/codex/settings/usage"
+CODEX_CACHE_FILE = os.path.expanduser("~/.codex-usage-cache.json")
 CODEX_PREFERRED_WINDOW_MINUTES = 5 * 60
 CODEX_FALLBACK_WINDOW_MINUTES = 7 * 24 * 60
+CODEX_API_TIMEOUT = 12
+CODEX_RPC_TIMEOUT = 20
 TASKS_STATUS_FILE = os.path.expanduser("~/.local/state/tasks/run-status.json")
 
 # At login / wake-from-sleep the network often isn't up yet when SwiftBar fires
@@ -352,86 +366,453 @@ def pct(w):
     return f"{w['remaining']:.0f}%" if w else "—"
 
 
-def codex_window_from_limit(limit):
+# ---------------------------------------------------------------------------
+# Codex usage
+#
+# Four sources, tried in order, first usable answer wins:
+#   1. api   — GET /backend-api/wham/usage with the OAuth token the Codex CLI
+#              already stores in ~/.codex/auth.json. Authoritative, always current.
+#   2. rpc   — `codex app-server` over JSON-RPC (account/rateLimits/read). Slower,
+#              since it spawns a process, but it is the CLI's own path: it still
+#              works when the stored token needs refreshing, and refreshes
+#              auth.json on the way through, repairing source 1 for next time.
+#   3. logs  — replay the newest usable record from the local rollout logs. Works
+#              offline, but is only ever as fresh as the last Codex run.
+#   4. cache — the last good api/rpc answer.
+#
+# A log record is easily days old while the cache may hold a reading from minutes
+# ago, so 3 and 4 compete on captured_at rather than in a fixed order.
+# ---------------------------------------------------------------------------
+
+def _codex_home():
+    return os.path.expanduser(os.environ.get("CODEX_HOME") or "~/.codex")
+
+
+def _pick(d, *keys):
+    """First non-null value among `keys` — the producers below spell the same
+    field several different ways."""
+    for k in keys:
+        v = d.get(k)
+        if v is not None:
+            return v
+    return None
+
+
+def codex_window(limit):
+    """Normalise one rate-limit window into the same shape as `window()`.
+
+    The dialects we have to swallow:
+        wham API     used_percent / limit_window_seconds / reset_at
+        app-server   usedPercent  / windowDurationMins   / resetsAt
+        session log  used_percent / window_minutes       / resets_at
+    """
     if not isinstance(limit, dict):
         return None
-    used = limit.get("used_percent")
+    used = _pick(limit, "used_percent", "usedPercent")
     if used is None:
         return None
     try:
         used = float(used)
     except (TypeError, ValueError):
         return None
-    resets_at = limit.get("resets_at")
+
+    mins = _pick(limit, "window_minutes", "windowDurationMins")
+    if mins is None:
+        secs = _pick(limit, "limit_window_seconds", "limitWindowSeconds")
+        if secs is not None:
+            try:
+                mins = float(secs) / 60.0
+            except (TypeError, ValueError):
+                mins = None
+    try:
+        mins = int(mins) if mins is not None else None
+    except (TypeError, ValueError):
+        mins = None
+
     resets_iso = None
-    if resets_at:
+    resets_at = _pick(limit, "resets_at", "resetsAt", "reset_at", "resetAt")
+    if resets_at is not None:
         try:
             resets_iso = datetime.fromtimestamp(float(resets_at), timezone.utc).isoformat()
         except (TypeError, ValueError, OSError):
             resets_iso = None
+
     return {
         "used": used,
         "remaining": max(0.0, 100.0 - used),
         "resets_at": resets_iso,
-        "window_minutes": limit.get("window_minutes"),
+        "window_minutes": mins,
     }
 
 
-def latest_codex_rate_limits(max_files=30):
-    files = glob(os.path.join(CODEX_SESSIONS_DIR, "*", "*", "*", "*.jsonl"))
-    files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-
-    latest = None
-    for path in files[:max_files]:
-        try:
-            with open(path) as f:
-                for line in f:
-                    try:
-                        obj = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    payload = obj.get("payload") or {}
-                    if obj.get("type") != "event_msg" or payload.get("type") != "token_count":
-                        continue
-                    rate_limits = payload.get("rate_limits")
-                    if rate_limits:
-                        latest = (obj.get("timestamp"), rate_limits)
-        except OSError:
+def codex_collect_windows(*blobs):
+    """Every usable window across the given containers, deduped on window length
+    and ordered shortest-first, so the session lane precedes the weekly one."""
+    found = []
+    for blob in blobs:
+        if not isinstance(blob, dict):
             continue
-        if latest:
-            return latest
-    return None
+        for key in ("primary_window", "primary", "secondary_window", "secondary",
+                    "individual_limit", "individualLimit"):
+            w = codex_window(blob.get(key))
+            if w:
+                found.append(w)
+        extra = _pick(blob, "additional_rate_limits", "additionalRateLimits") or []
+        if isinstance(extra, list):
+            for lim in extra:
+                w = codex_window(lim)
+                if w:
+                    found.append(w)
+
+    seen, deduped = set(), []
+    for w in found:
+        if w["window_minutes"] in seen:
+            continue
+        seen.add(w["window_minutes"])
+        deduped.append(w)
+    deduped.sort(key=lambda w: (w["window_minutes"] is None, w["window_minutes"] or 0))
+    return deduped
 
 
-def read_codex_window(preferred_minutes=CODEX_PREFERRED_WINDOW_MINUTES):
-    latest = latest_codex_rate_limits()
-    if not latest:
+def codex_headline(windows):
+    """The window that goes in the menu bar: the 5-hour session lane when the
+    plan has one, else the weekly lane, else the shortest we found."""
+    for target in (CODEX_PREFERRED_WINDOW_MINUTES, CODEX_FALLBACK_WINDOW_MINUTES):
+        for w in windows:
+            if w["window_minutes"] == target:
+                return w
+    return windows[0] if windows else None
+
+
+def codex_snapshot(windows, credits=None, source=None, captured_at=None,
+                   plan=None, email=None, reset_credits=None):
+    if not windows and not credits:
+        return None
+    return {
+        "windows": windows,
+        "headline": codex_headline(windows),
+        "credits": credits if isinstance(credits, dict) else None,
+        "reset_credits": reset_credits,
+        "plan": plan,
+        "email": email,
+        "source": source,
+        "captured_at": captured_at if captured_at is not None else time.time(),
+    }
+
+
+def codex_auth():
+    """The OAuth bearer + account id the Codex CLI stores for itself."""
+    try:
+        with open(os.path.join(_codex_home(), "auth.json")) as f:
+            blob = json.load(f)
+    except Exception:
+        return None
+    tokens = blob.get("tokens") or {}
+    token = tokens.get("access_token")
+    if not token:
+        return None
+    return {"token": token, "account_id": tokens.get("account_id")}
+
+
+def codex_from_api():
+    """Source 1 — the endpoint the Codex usage dashboard itself reads."""
+    auth = codex_auth()
+    if not auth:
+        return None
+    headers = {
+        "Authorization": f"Bearer {auth['token']}",
+        "Accept": "application/json",
+        "User-Agent": "claude-usage-menubar/1.0",
+    }
+    if auth.get("account_id"):
+        headers["chatgpt-account-id"] = auth["account_id"]
+    req = urllib.request.Request(CODEX_USAGE_URL, headers=headers)
+    with urllib.request.urlopen(req, timeout=CODEX_API_TIMEOUT) as resp:
+        data = json.loads(resp.read().decode())
+
+    # `additional_rate_limits` sits beside `rate_limit`, not inside it.
+    windows = codex_collect_windows(data.get("rate_limit") or {}, data)
+    return codex_snapshot(
+        windows,
+        credits=data.get("credits"),
+        source="api",
+        plan=data.get("plan_type"),
+        email=data.get("email"),
+        reset_credits=(data.get("rate_limit_reset_credits") or {}).get("available_count"),
+    )
+
+
+def codex_from_rpc():
+    """Source 2 — drive the CLI's own JSON-RPC server.
+
+    Read-only sandbox with approvals never, so it cannot touch anything. Worth
+    the process spawn only as a fallback: it keeps working when the stored token
+    has gone stale, because the CLI refreshes it on the way through.
+    """
+    if not shutil.which("codex"):
+        return None
+    proc = subprocess.Popen(
+        ["codex", "-s", "read-only", "-a", "never", "app-server"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        text=True, bufsize=1,
+    )
+    # A dedicated reader thread keeps a silent server from wedging the plugin;
+    # select() on a text-mode pipe can also hide already-buffered lines.
+    lines = queue.Queue()
+
+    def reader():
+        try:
+            for line in proc.stdout:
+                lines.put(line)
+        except Exception:
+            pass
+        finally:
+            lines.put(None)
+
+    threading.Thread(target=reader, daemon=True).start()
+    limits, account = None, None
+    try:
+        for msg in (
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+             "params": {"clientInfo": {"name": "claude-usage-menubar",
+                                       "title": "claude-usage-menubar",
+                                       "version": "1.0"}}},
+            {"jsonrpc": "2.0", "id": 2, "method": "account/rateLimits/read", "params": {}},
+            {"jsonrpc": "2.0", "id": 3, "method": "account/read", "params": {}},
+        ):
+            proc.stdin.write(json.dumps(msg) + "\n")
+        proc.stdin.flush()
+
+        deadline = time.time() + CODEX_RPC_TIMEOUT
+        while limits is None:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            try:
+                line = lines.get(timeout=remaining)
+            except queue.Empty:
+                break
+            if line is None:  # server closed its side
+                break
+            try:
+                obj = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if obj.get("id") == 2:
+                limits = obj.get("result") or {}
+            elif obj.get("id") == 3:
+                account = (obj.get("result") or {}).get("account") or {}
+    except Exception:
+        return None
+    finally:
+        try:
+            proc.kill()
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+
+    if not limits:
+        return None
+    rl = limits.get("rateLimits") or {}
+    # rateLimitsByLimitId can carry several buckets; "codex" is the coding quota,
+    # others (e.g. "premium") are unrelated and are often reported all-null.
+    by_id = limits.get("rateLimitsByLimitId") or {}
+    windows = codex_collect_windows(by_id.get("codex") or {}, rl)
+    if not windows:
+        for bucket in by_id.values():
+            windows = codex_collect_windows(bucket)
+            if windows:
+                break
+    return codex_snapshot(
+        windows,
+        credits=rl.get("credits"),
+        source="rpc",
+        plan=rl.get("planType") or (account or {}).get("planType"),
+        email=(account or {}).get("email"),
+        reset_credits=(limits.get("rateLimitResetCredits") or {}).get("availableCount"),
+    )
+
+
+def _codex_log_records(path):
+    """Every rate-limit payload in one rollout log, oldest first."""
+    out = []
+    try:
+        with open(path) as f:
+            for line in f:
+                try:
+                    obj = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                payload = obj.get("payload") or {}
+                if obj.get("type") != "event_msg" or payload.get("type") != "token_count":
+                    continue
+                rate_limits = payload.get("rate_limits")
+                if rate_limits:
+                    out.append((obj.get("timestamp"), rate_limits))
+    except OSError:
+        pass
+    return out
+
+
+def _codex_log_time(stamp, path):
+    """When a log record was true — its own timestamp, else the file's mtime."""
+    try:
+        return datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        pass
+    try:
+        return os.path.getmtime(path)
+    except OSError:
         return None
 
-    _, rate_limits = latest
-    for key in ("primary", "secondary", "individual_limit"):
-        w = codex_window_from_limit(rate_limits.get(key))
-        if w and w.get("window_minutes") == preferred_minutes:
-            return {"kind": key, **w}
 
-    for key in ("primary", "secondary", "individual_limit"):
-        w = codex_window_from_limit(rate_limits.get(key))
-        if w and w.get("window_minutes") == CODEX_FALLBACK_WINDOW_MINUTES:
-            return {"kind": key, **w}
-    return None
+def codex_from_logs(max_files=40):
+    """Source 3 — the newest *usable* record in the local rollout logs.
+
+    Two traps the earlier scanner fell into, both of which surfaced as a bare
+    dash in the menu bar:
+      * it returned at the first file holding any `rate_limits` object, so a
+        single session whose only record was unusable masked every older usable
+        one;
+      * Codex emits more than one limit bucket, and the non-"codex" buckets
+        (limit_id "premium") carry null windows with a credits-only payload.
+    So keep walking until a record actually yields a window.
+    """
+    files = glob(os.path.join(CODEX_SESSIONS_DIR, "*", "*", "*", "*.jsonl"))
+    files += glob(os.path.join(CODEX_ARCHIVED_SESSIONS_DIR, "*.jsonl"))
+    try:
+        files.sort(key=os.path.getmtime, reverse=True)
+    except OSError:
+        pass
+
+    fallback = None  # a credits-only record, if that is genuinely all there is
+    for path in files[:max_files]:
+        for stamp, rate_limits in reversed(_codex_log_records(path)):
+            by_id = _pick(rate_limits, "rate_limits_by_limit_id", "rateLimitsByLimitId") or {}
+            windows = codex_collect_windows(by_id.get("codex") or {}, rate_limits)
+            if not windows:
+                for bucket in by_id.values():
+                    windows = codex_collect_windows(bucket)
+                    if windows:
+                        break
+            captured = _codex_log_time(stamp, path)
+            if windows:
+                return codex_snapshot(
+                    windows, credits=rate_limits.get("credits"), source="logs",
+                    captured_at=captured, plan=rate_limits.get("plan_type"))
+            if fallback is None and rate_limits.get("credits"):
+                fallback = codex_snapshot(
+                    [], credits=rate_limits.get("credits"), source="logs",
+                    captured_at=captured, plan=rate_limits.get("plan_type"))
+    return fallback
+
+
+def codex_write_cache(snap):
+    try:
+        with open(CODEX_CACHE_FILE, "w") as f:
+            json.dump(snap, f)
+    except Exception:
+        pass
+
+
+def codex_read_cache():
+    try:
+        with open(CODEX_CACHE_FILE) as f:
+            snap = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(snap, dict) or not snap.get("captured_at"):
+        return None
+    snap["source"] = "cache"
+    return snap
+
+
+def read_codex_usage():
+    """The best Codex reading available, with its provenance attached."""
+    live = {"api": codex_from_api, "rpc": codex_from_rpc, "logs": codex_from_logs}
+    forced = os.environ.get("CODEX_USAGE_SOURCE")
+    if forced in live:  # for testing one source in isolation
+        try:
+            return live[forced]()
+        except Exception:
+            return None
+
+    for fetch_one in (codex_from_api, codex_from_rpc):
+        try:
+            snap = fetch_one()
+        except Exception:
+            snap = None
+        if snap:
+            codex_write_cache(snap)
+            return snap
+
+    # Neither live source answered. A cached reading from minutes ago beats a log
+    # record from days ago, so pick on recency rather than on order.
+    candidates = []
+    for fetch_one in (codex_read_cache, codex_from_logs):
+        try:
+            snap = fetch_one()
+        except Exception:
+            snap = None
+        if snap:
+            candidates.append(snap)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda s: s.get("captured_at") or 0)
 
 
 def codex_window_label(w):
     if not w:
         return "5h"
-    if w.get("window_minutes") == CODEX_PREFERRED_WINDOW_MINUTES:
-        return "5h"
-    if w.get("window_minutes") == CODEX_FALLBACK_WINDOW_MINUTES:
-        return "7d"
     mins = w.get("window_minutes")
-    if isinstance(mins, (int, float)):
-        return f"{int(mins)}m"
+    if mins == CODEX_PREFERRED_WINDOW_MINUTES:
+        return "5h"
+    if mins == CODEX_FALLBACK_WINDOW_MINUTES:
+        return "7d"
+    if isinstance(mins, int):
+        if mins % 1440 == 0:
+            return f"{mins // 1440}d"
+        if mins % 60 == 0:
+            return f"{mins // 60}h"
+        return f"{mins}m"
     return "usage"
+
+
+def codex_window_title(w):
+    """Long form of the label, for a dropdown heading."""
+    label = codex_window_label(w)
+    return {"5h": "5-hour session", "7d": "Weekly"}.get(label, f"{label} window")
+
+
+CODEX_STALE_AFTER = 30 * 60  # a replayed reading older than this is worth flagging
+
+
+def codex_stale_age(snap):
+    """Seconds since the reading was true, when that is worth showing."""
+    if not snap or snap.get("source") in ("api", "rpc"):
+        return None
+    captured = snap.get("captured_at")
+    if not captured:
+        return None
+    age = time.time() - captured
+    return age if age >= CODEX_STALE_AFTER else None
+
+
+def codex_credits_line(credits):
+    if not isinstance(credits, dict):
+        return None
+    if credits.get("unlimited"):
+        return "Credits  ·  unlimited"
+    balance = credits.get("balance")
+    if balance is None:
+        return None
+    try:
+        pretty = f"{float(balance):,.0f}"
+    except (TypeError, ValueError):
+        pretty = str(balance)
+    if not credits.get("has_credits") and pretty == "0":
+        return "Credits  ·  none"
+    return f"Credits  ·  {pretty}"
 
 
 def section(label, w):
@@ -479,15 +860,20 @@ def render(data, plan="", stale_age=None):
     sonnet = window(data.get("seven_day_sonnet"))
     opus = window(data.get("seven_day_opus"))
     extra = data.get("extra_usage") or {}
-    codex = read_codex_window()
-    codex_label = codex_window_label(codex)
+    codex = read_codex_usage()
+    codex_head = codex.get("headline") if codex else None
+    codex_label = codex_window_label(codex_head)
+    codex_stale = codex_stale_age(codex)
     tasks_problem = tasks_failure()
 
     # ---- menu bar title ----
     title = (
         f":sparkle: {dot_for(five['remaining'] if five else None)}5h{pct(five)}"
         f"·{dot_for(week['remaining'] if week else None)}7d{pct(week)}"
-        f"·{dot_for(codex['remaining'] if codex else None)}C{codex_label}{pct(codex)}"
+        f"·{dot_for(codex_head['remaining'] if codex_head else None)}C{codex_label}"
+        # "~" marks a replayed reading — the live sources were unreachable, so
+        # the number is as old as the age spelled out in the dropdown.
+        f"{'~' if codex_stale else ''}{pct(codex_head)}"
     )
     if tasks_problem:
         title = "⚠ Claude paused · " + title
@@ -524,11 +910,39 @@ def render(data, plan="", stale_age=None):
         section("Weekly · Opus", opus)
 
     print("---")
-    print(f"Codex usage | size=12 color={GREY}")
-    if codex:
-        section(f"Codex · {codex_label} window", codex)
+    codex_plan = (codex.get("plan") or "") if codex else ""
+    print(f"Codex{(' ' + codex_plan) if codex_plan else ''} usage | size=12 color={GREY}")
+    print("---")
+    if codex and codex.get("windows"):
+        for w in codex["windows"]:
+            section(f"Codex · {codex_window_title(w)}", w)
+    elif codex:
+        print(f"Codex · no rate-limit window reported | color={GREY}")
     else:
-        print(f"Codex · 5h/7d window: n/a | color={GREY}")
+        print(f"Codex · unavailable from all sources | color={GREY}")
+        print(f"--tried the usage API, `codex app-server`, and the session logs "
+              f"| color={GREY} size=11")
+
+    if codex:
+        credits = codex_credits_line(codex.get("credits"))
+        if credits:
+            print(f"{credits} | color={GREY}")
+        resets_available = codex.get("reset_credits")
+        if resets_available:
+            plural = "s" if resets_available != 1 else ""
+            print(f"Rate-limit reset{plural}  ·  {resets_available} available | color={GREY}")
+        origin = {
+            "api": "live · usage API",
+            "rpc": "live · codex app-server",
+            "logs": "replayed from session logs",
+            "cache": "last good fetch",
+        }.get(codex.get("source"), codex.get("source") or "unknown")
+        if codex_stale:
+            print(f"⚠ Codex reading is {fmt_age(codex_stale)} — {origin} "
+                  f"| color={AMBER} size=11")
+        else:
+            print(f"source: {origin} | color={GREY} size=11")
+    print(f"Open Codex usage page | href={CODEX_USAGE_PAGE}")
 
     if extra.get("is_enabled"):
         used = extra.get("used_credits")
@@ -604,7 +1018,33 @@ def maybe_notify(data):
             pass
 
 
+def codex_debug():
+    """Report what each Codex source returns, independently — run by hand when
+    the menu bar shows something you don't believe."""
+    for name, fetch_one in (("api", codex_from_api), ("rpc", codex_from_rpc),
+                            ("logs", codex_from_logs), ("cache", codex_read_cache)):
+        try:
+            snap = fetch_one()
+        except Exception as e:
+            print(f"{name:6} ERROR  {type(e).__name__}: {e}")
+            continue
+        if not snap:
+            print(f"{name:6} —      no usable reading")
+            continue
+        age = time.time() - (snap.get("captured_at") or time.time())
+        windows = ", ".join(
+            f"{codex_window_label(w)} {w['remaining']:.0f}% left" for w in snap["windows"]
+        ) or "no windows"
+        print(f"{name:6} OK     {windows}  ({fmt_age(age)}, plan={snap.get('plan')})")
+    chosen = read_codex_usage()
+    print(f"\nchosen: {chosen.get('source') if chosen else None}")
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--codex-debug":
+        codex_debug()
+        return
+
     if len(sys.argv) > 2 and sys.argv[1] == "--set-interval":
         try:
             set_interval(sys.argv[2])
